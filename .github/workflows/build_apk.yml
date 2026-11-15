@@ -1,4 +1,4 @@
-name: Build ULTRA Pro Hikvision AI Enhancer (Real Pretrained Weights)
+name: Build ULTRA Pro Hikvision AI Enhancer (Fixed & Verified)
 
 on:
   push:
@@ -18,95 +18,75 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Download & Convert REAL Pre-Trained AI Weights (Real-ESRGAN & Zero-DCE)
+      - name: Set up Python 3.10 for AI Model Conversion
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download & Convert REAL Pre-Trained Real-ESRGAN Weights
         run: |
           mkdir -p app/src/main/assets
           pip install --upgrade pip
-          pip install torch torchvision onnx tensorflow onnx2tf requests
+          pip install torch torchvision tensorflow requests numpy
 
           python3 - << 'EOF'
-          import os
           import urllib.request
+          import numpy as np
           import torch
-          import torch.nn as nn
           import tensorflow as tf
 
-          print("1. Downloading official Real-ESRGAN Compact (realesr-general-x4v3.pth) trained weights...")
+          print("1. Downloading official Real-ESRGAN Compact (realesr-general-x4v3.pth)...")
           url_esrgan = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
           pth_path = "realesr-general-x4v3.pth"
           urllib.request.urlretrieve(url_esrgan, pth_path)
 
-          # Official SRVGGNetCompact Architecture matching xinntao's pre-trained weights
-          class SRVGGNetCompact(nn.Module):
-              def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4):
-                  super(SRVGGNetCompact, self).__init__()
-                  self.upscale = upscale
-                  self.body = nn.ModuleList()
-                  self.body.append(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1))
-                  self.body.append(nn.PReLU(num_parameters=num_feat))
-                  for _ in range(num_conv):
-                      self.body.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1))
-                      self.body.append(nn.PReLU(num_parameters=num_feat))
-                  self.body.append(nn.Conv2d(num_feat, num_out_ch * (upscale ** 2), 3, 1, 1))
-                  self.upsampler = nn.PixelShuffle(upscale)
+          ckpt = torch.load(pth_path, map_location="cpu", weights_only=False)
+          sd = ckpt.get("params_ema", ckpt.get("params", ckpt))
+          print("Loaded official checkpoint keys:", len(sd))
 
-              def forward(self, x):
-                  out = x
-                  for layer in self.body:
-                      out = layer(out)
-                  out = self.upsampler(out)
-                  base = nn.functional.interpolate(x, scale_factor=self.upscale, mode='nearest')
-                  return torch.clamp(out + base, 0.0, 1.0)
+          # Build Pure TensorFlow Graph with Direct Pre-trained Weight Injection (Zero Keras 3 bugs)
+          @tf.function(input_signature=[tf.TensorSpec(shape=[1, 128, 128, 3], dtype=tf.float32)])
+          def realesrgan_x4_infer(inp):
+              x = inp
+              # 33 Conv + 33 PReLU pairs (body.0 to body.65)
+              for idx in range(0, 66, 2):
+                  w_pt = sd[f"body.{idx}.weight"].detach().cpu().numpy()
+                  b_pt = sd[f"body.{idx}.bias"].detach().cpu().numpy()
+                  a_pt = sd[f"body.{idx+1}.weight"].detach().cpu().numpy()
 
-          model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4)
-          ckpt = torch.load(pth_path, map_location="cpu")
-          state_dict = ckpt.get("params_ema", ckpt.get("params", ckpt))
-          model.load_state_dict(state_dict, strict=True)
-          model.eval()
-          print("Successfully loaded 32-layer Real-ESRGAN trained weights!")
+                  w_tf = tf.constant(np.transpose(w_pt, (2, 3, 1, 0)), dtype=tf.float32)
+                  b_tf = tf.constant(b_pt, dtype=tf.float32)
+                  a_tf = tf.constant(a_pt.reshape(1, 1, 1, -1), dtype=tf.float32)
 
-          # Convert PyTorch -> Keras/TFLite FP16 with exact weight transfer (NHWC layout for Adreno GPU)
-          inp = tf.keras.Input(shape=(128, 128, 3), batch_size=1)
-          x = inp
-          with torch.no_grad():
-              idx = 0
-              while idx < len(model.body) - 1:
-                  conv_pt = model.body[idx]
-                  prelu_pt = model.body[idx + 1]
-                  w = conv_pt.weight.detach().numpy().transpose(2, 3, 1, 0) # OIHW -> HWIO
-                  b = conv_pt.bias.detach().numpy()
-                  alpha = prelu_pt.weight.detach().numpy().reshape(1, 1, -1)
+                  x = tf.nn.conv2d(x, w_tf, strides=[1, 1, 1, 1], padding="SAME")
+                  x = tf.nn.bias_add(x, b_tf)
+                  # Exact PReLU formula: max(0, x) + alpha * min(0, x)
+                  x = tf.maximum(0.0, x) + a_tf * tf.minimum(0.0, x)
 
-                  conv_tf = tf.keras.layers.Conv2D(w.shape[-1], 3, padding='same', weights=[w, b])
-                  prelu_tf = tf.keras.layers.PReLU(shared_axes=[1, 2], weights=[alpha])
-                  x = prelu_tf(conv_tf(x))
-                  idx += 2
+              # Final reconstruction layer (body.66: 64 -> 48 channels for 4x PixelShuffle)
+              w_last = tf.constant(np.transpose(sd["body.66.weight"].detach().cpu().numpy(), (2, 3, 1, 0)), dtype=tf.float32)
+              b_last = tf.constant(sd["body.66.bias"].detach().cpu().numpy(), dtype=tf.float32)
+              x = tf.nn.conv2d(x, w_last, strides=[1, 1, 1, 1], padding="SAME")
+              x = tf.nn.bias_add(x, b_last)
 
-              last_conv_pt = model.body[-1]
-              w_last = last_conv_pt.weight.detach().numpy().transpose(2, 3, 1, 0)
-              b_last = last_conv_pt.bias.detach().numpy()
-              x = tf.keras.layers.Conv2D(w_last.shape[-1], 3, padding='same', weights=[w_last, b_last])(x)
+              out_shuffled = tf.nn.depth_to_space(x, 4)
+              base_up = tf.image.resize(inp, [512, 512], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+              return tf.clip_by_value(out_shuffled + base_up, 0.0, 1.0)
 
-          # Depth-to-Space (PixelShuffle 4x) + Residual Base Connection
-          out_shuffled = tf.keras.layers.Lambda(lambda t: tf.nn.depth_to_space(t, 4))(x)
-          base_up = tf.keras.layers.UpSampling2D(size=(4, 4), interpolation='nearest')(inp)
-          final_out = tf.keras.layers.Lambda(lambda t: tf.clip_by_value(t[0] + t[1], 0.0, 1.0))([out_shuffled, base_up])
-
-          keras_esrgan = tf.keras.Model(inp, final_out)
-          converter = tf.lite.TFLiteConverter.from_keras_model(keras_esrgan)
+          concrete_func = realesrgan_x4_infer.get_concrete_function()
+          converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
           converter.optimizations = [tf.lite.Optimize.DEFAULT]
           converter.target_spec.supported_types = [tf.float16]
-          tflite_esrgan = converter.convert()
+          tflite_model = converter.convert()
 
           with open("app/src/main/assets/realesrgan_x4_pretrained_fp16.tflite", "wb") as f:
-              f.write(tflite_esrgan)
-          print("Saved REAL Pre-trained Real-ESRGAN FP16 TFLite model!")
+              f.write(tflite_model)
+          print("Successfully generated realesrgan_x4_pretrained_fp16.tflite! Size:", len(tflite_model) // 1024, "KB")
           EOF
 
-      - name: Generate Ultra Multi-Frame & Frequency-Blending Android Project
+      - name: Generate Android Project Source Files
         run: |
           mkdir -p app/src/main/java/com/hikvision/aienhancer/domain
-          mkdir -p app/src/main/java/com/hikvision/aienhancer/util
           mkdir -p app/src/main/java/com/hikvision/aienhancer/ai
           mkdir -p app/src/main/java/com/hikvision/aienhancer/pipeline
           mkdir -p app/src/main/java/com/hikvision/aienhancer/ui
@@ -150,8 +130,8 @@ jobs:
                   applicationId = "com.hikvision.aienhancer"
                   minSdk = 34
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0.0-ULTRA-PRO"
+                  versionCode = 3
+                  versionName = "3.0.0-ULTRA-PRO"
                   ndk { abiFilters.add("arm64-v8a") }
               }
 
@@ -170,6 +150,9 @@ jobs:
               buildFeatures { compose = true }
               composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
               androidResources { noCompress += listOf("tflite") }
+              packaging {
+                  jniLibs { useLegacyPackaging = true }
+              }
           }
 
           dependencies {
@@ -177,7 +160,6 @@ jobs:
               implementation(composeBom)
               implementation("androidx.compose.ui:ui")
               implementation("androidx.compose.material3:material3")
-              implementation("androidx.compose.material:material-icons-extended")
               implementation("androidx.activity:activity-compose:1.9.1")
               implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
               implementation("com.google.ai.edge.litert:litert:1.0.1")
@@ -220,7 +202,7 @@ jobs:
               val enableMultiFrameFusion: Boolean,
               val enableRetinexNightVision: Boolean,
               val enableBlockDeartifact: Boolean,
-              val naturalTextureBlend: Float // 0.0 = Pure AI (Plastic), 0.25 = Natural Cinema/Forensic Look
+              val naturalTextureBlend: Float
           ) {
               ULTRA_NATURAL_PRO(
                   "الترميم الفائق الطبيعي (Real-ESRGAN + دمج 3 إطارات)",
@@ -266,7 +248,6 @@ jobs:
           import org.opencv.android.Utils
           import org.opencv.core.*
           import org.opencv.imgproc.Imgproc
-          import org.opencv.photo.Photo
           import org.tensorflow.lite.Interpreter
           import org.tensorflow.lite.gpu.CompatibilityList
           import org.tensorflow.lite.gpu.GpuDelegate
@@ -328,20 +309,11 @@ jobs:
                   }
               }
 
-              /**
-               * Full Professional Restoration Pipeline:
-               * 1. Multi-Frame Temporal Super-Fusion (extracts real sub-pixel details across consecutive frames)
-               * 2. Multi-Scale Retinex (MSRCR) Luminance Recovery for Dark/IR CCTV
-               * 3. H.264/H.265 Deblocking & Chroma Denoising in LAB Color Space
-               * 4. 32-Layer Pretrained Real-ESRGAN Tiled Neural Inference with Cosine Hann Window Feathering
-               * 5. Frequency-Separated Natural Texture Blending (eliminates artificial plastic look)
-               */
               fun enhanceFrame(inputBitmap: Bitmap): Bitmap {
                   val rawMat = Mat()
                   Utils.bitmapToMat(inputBitmap, rawMat)
                   Imgproc.cvtColor(rawMat, rawMat, Imgproc.COLOR_RGBA2RGB)
 
-                  // 1. Multi-Frame Temporal Detail Fusion
                   var working = if (config.enableMultiFrameFusion) {
                       fuseTemporalFrames(rawMat)
                   } else {
@@ -349,21 +321,18 @@ jobs:
                   }
                   rawMat.release()
 
-                  // 2. Retinex Night-Vision Shadow & Highlight Recovery (LAB Luminance Only)
                   if (config.enableRetinexNightVision) {
                       val retinex = applyRetinexLuminanceRecovery(working)
                       working.release()
                       working = retinex
                   }
 
-                  // 3. Edge-Preserving H.264 Compression Artifact Removal
                   if (config.enableBlockDeartifact) {
                       val deblocked = applyLabChromaAndLumaDenoise(working)
                       working.release()
                       working = deblocked
                   }
 
-                  // 4. True Pre-trained Real-ESRGAN Neural Super-Resolution (with overlapping feathered tiles)
                   val interpreter = esrganInterpreter
                   val neuralUpscaled = if (interpreter != null) {
                       runFeatheredRealEsrgan(working, interpreter, config.scaleFactor)
@@ -371,7 +340,6 @@ jobs:
                       working.clone()
                   }
 
-                  // 5. Natural Texture & Frequency Blending (Prevents over-smoothed plastic look)
                   val finalMat = blendNaturalHighFrequencyDetails(working, neuralUpscaled, config.naturalTextureBlend)
                   working.release()
                   neuralUpscaled.release()
@@ -397,9 +365,11 @@ jobs:
                       frameWindow.removeFirst().release()
                   }
 
-                  if (frameWindow.size == 1) return currentRgb.clone()
+                  if (frameWindow.size == 1) {
+                      curFloat.release()
+                      return currentRgb.clone()
+                  }
 
-                  // Motion-adaptive pixel fusion: combines static & slow-moving regions across 3 frames to boost SNR by +4.8 dB
                   val fused = curFloat.clone()
                   for (i in 0 until frameWindow.size - 1) {
                       val pastFrame = frameWindow.elementAt(i)
@@ -408,7 +378,6 @@ jobs:
                       val grayDiff = Mat()
                       Imgproc.cvtColor(diff, grayDiff, Imgproc.COLOR_RGB2GRAY)
 
-                      // Pixels with motion delta < 14 levels get fused for real multi-frame super-resolution
                       val staticMask = Mat()
                       Imgproc.threshold(grayDiff, staticMask, 14.0, 1.0, Imgproc.THRESH_BINARY_INV)
                       staticMask.convertTo(staticMask, CvType.CV_8UC1)
@@ -434,18 +403,15 @@ jobs:
                   Core.split(lab, ch)
 
                   val lChannel = ch[0]
-                  // Dual-scale illumination estimation + CLAHE micro-contrast
                   val clahe = Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
                   val claheL = Mat()
                   clahe.apply(lChannel, claheL)
 
-                  // Local shadow illumination map
                   val blurLarge = Mat()
                   Imgproc.GaussianBlur(lChannel, blurLarge, Size(0.0, 0.0), 25.0)
                   val detailLayer = Mat()
                   Core.addWeighted(lChannel, 1.25, blurLarge, -0.25, 0.0, detailLayer)
 
-                  // Natural blend: 55% CLAHE + 25% Local Retinex Detail + 20% Original Luminance
                   val temp = Mat()
                   Core.addWeighted(claheL, 0.55, detailLayer, 0.25, 0.0, temp)
                   Core.addWeighted(temp, 1.0, lChannel, 0.20, 0.0, ch[0])
@@ -461,7 +427,6 @@ jobs:
               }
 
               private fun applyLabChromaAndLumaDenoise(rgb: Mat): Mat {
-                  // Separates color noise (heavy smoothing on A/B) from luminance detail (gentle edge-preserving filter on L)
                   val lab = Mat()
                   Imgproc.cvtColor(rgb, lab, Imgproc.COLOR_RGB2Lab)
                   val ch = ArrayList<Mat>(3)
@@ -539,7 +504,6 @@ jobs:
                           val outTile = Mat(outTileDim, outTileDim, CvType.CV_8UC3)
                           outTile.put(0, 0, outBytes)
 
-                          // Crop inner non-border region to eliminate tile seams
                           val marginIn = if (xStep > 0) overlap / 2 else 0
                           val marginTop = if (yStep > 0) overlap / 2 else 0
                           val copyX = marginIn * modelScale
@@ -566,10 +530,6 @@ jobs:
                   return outMat4x
               }
 
-              /**
-               * Blends the AI-reconstructed frame with Lanczos4 natural structure + subtle micro-contrast
-               * so faces, clothing, and walls look organic and realistic rather than "painted".
-               */
               private fun blendNaturalHighFrequencyDetails(originalClean: Mat, aiUpscaled: Mat, naturalRatio: Float): Mat {
                   val naturalUp = Mat()
                   Imgproc.resize(originalClean, naturalUp, aiUpscaled.size(), 0.0, 0.0, Imgproc.INTER_LANCZOS4)
@@ -578,7 +538,6 @@ jobs:
                   Core.addWeighted(aiUpscaled, (1.0 - naturalRatio), naturalUp, naturalRatio.toDouble(), 0.0, blended)
                   naturalUp.release()
 
-                  // Subtle unsharp micro-contrast pass for crisp optical focus
                   val gaussian = Mat()
                   Imgproc.GaussianBlur(blended, gaussian, Size(0.0, 0.0), 1.0)
                   val crispOut = Mat()
@@ -653,7 +612,6 @@ jobs:
                           }
                       }
 
-                      // High-bitrate H.264 profile to preserve restored micro-textures
                       val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
                           setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
                           setInteger(MediaFormat.KEY_BIT_RATE, outW * outH * 10)
@@ -760,11 +718,8 @@ jobs:
           import androidx.compose.foundation.*
           import androidx.compose.foundation.gestures.detectHorizontalDragGestures
           import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.lazy.LazyColumn
-          import androidx.compose.foundation.lazy.items
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.geometry.Offset
           import androidx.compose.ui.graphics.Color
@@ -905,10 +860,12 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Compile Signed Ultra Pro APK
+      - name: Install Gradle & Compile Signed Ultra Pro APK
         run: |
+          sudo apt-get update && sudo apt-get install -y gradle
           gradle wrapper --gradle-version 8.7
-          ./gradlew assembleRelease --no-daemon
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Upload Ultra Pro APK Artifact
         uses: actions/upload-artifact@v4
